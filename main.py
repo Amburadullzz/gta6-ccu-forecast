@@ -14,6 +14,10 @@ widens with sqrt(hour-1), scaled from the leave-one-out loss over the kit's comp
 widened further when the case sits beyond the comparable set in size, where no comparable can
 speak for it.
 
+Revision after the first pass: the per-hour medians are smoothed with a 1-2-1 kernel instead of a
+flat three-point mean, an hour with too few comparables borrows its neighbour's median rather than
+a thin one, and a case with no hour-1 print falls back to the last whole hour it recorded.
+
 Reads <id>.in from MAKEFUN_INPUT_DIR (default /input) and writes <id>.out to MAKEFUN_OUTPUT_DIR
 (default /output). Python 3 standard library only, no network, deterministic.
 """
@@ -21,6 +25,7 @@ Reads <id>.in from MAKEFUN_INPUT_DIR (default /input) and writes <id>.out to MAK
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
@@ -28,6 +33,7 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+HOURS = range(2, 25)
 
 # Tuned by leave-one-out over the kit's comparables: on the sixteen launches above 100,000
 # viewers in hour 1 the mean pinball loss falls from 0.261 (house baseline) to 0.216.
@@ -39,14 +45,13 @@ MIN_WEIGHT = 0.02
 TILT_HOURS = range(2, 9)
 TILT_CLIP = 0.40
 EXTRAPOLATION_SPREAD = 0.08
+MIN_SUPPORT = 3
 MIN_QUANTILE = 0.01
 MAX_QUANTILE = 1e9
 
 
 def hour_of(row_from, day_start):
     """The 1-based UTC hour a comparable's point falls in, counted from its own day start."""
-    from datetime import datetime
-
     def parse(text):
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
@@ -96,24 +101,33 @@ def shape(curves, p1):
         w = math.exp(-(gap * gap) / (2.0 * SCALE_KERNEL * SCALE_KERNEL)) if SCALE_KERNEL > 0 else 1.0
         weights.append(max(w, MIN_WEIGHT))
 
-    per_hour = {h: [] for h in range(2, 25)}
+    per_hour = {h: [] for h in HOURS}
     for hours, w in zip(curves, weights):
         base = hours[1]
-        for h in range(2, 25):
+        for h in HOURS:
             if h in hours:
                 per_hour[h].append((math.log(hours[h] / base), w))
 
     medians = {}
-    for h in range(2, 25):
-        medians[h] = weighted_median(per_hour[h]) if per_hour[h] else 0.0
+    for h in HOURS:
+        if len(per_hour[h]) >= MIN_SUPPORT:
+            medians[h] = weighted_median(per_hour[h])
+        else:
+            medians[h] = None
+    # An hour too thinly covered borrows the nearest hour that is not.
+    known = [h for h in HOURS if medians[h] is not None]
+    for h in HOURS:
+        if medians[h] is None:
+            if known:
+                medians[h] = medians[min(known, key=lambda k: abs(k - h))]
+            else:
+                medians[h] = 0.0
 
-    # One pass of a 3-point mean: comparables thin out at the edges of the day and a single
-    # odd hour should not bend the curve.
-    # 1-2-1 smoothing: the hour itself counts double, so a single odd neighbour cannot
-    # bend the curve while the edges of the day, where comparables thin out, still get a
-    # reading from the hour beside them.
+    # 1-2-1 smoothing: the hour itself counts double, so a single odd neighbour cannot bend the
+    # curve while the edges of the day, where comparables thin out, still get a reading from the
+    # hour beside them.
     smooth = {}
-    for h in range(2, 25):
+    for h in HOURS:
         num = 2.0 * medians[h]
         den = 2.0
         for k in (h - 1, h + 1):
@@ -147,54 +161,48 @@ def size_tilt(curves, weights, shape_by_hour):
     return max(-TILT_CLIP, min(TILT_CLIP, beta)), mean_x, max(xs)
 
 
-def forecast_case(case):
-    known = case.get("known") or []
-    first = next((row for row in known if row.get("hour") == 1), None)
+def first_hour_print(case):
+    """Hour 1's viewers, else the last whole hour the case recorded, else 1."""
+    first = next((row for row in case.get("known") or [] if row.get("hour") == 1), None)
     p1 = float(first["viewers"]) if first and first.get("viewers") else 0.0
     if p1 <= 0.0:
-        # No hour-1 print: the last whole hour the case recorded is the best stand-in.
-        hourly = case.get("history_hourly") or []
-        for row in reversed(hourly):
+        for row in reversed(case.get("history_hourly") or []):
             if row.get("viewers"):
                 p1 = float(row["viewers"])
                 break
-    p1 = max(1.0, p1)
+    return max(1.0, p1)
 
+
+def forecast_case(case):
+    p1 = first_hour_print(case)
     curves = load_curves(case)
-    if len(curves) < 3:
+    if len(curves) < MIN_SUPPORT:
         # Nothing to transfer from: hold hour 1 with the baseline's widening band.
-        rows = {h: [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z] for h in range(2, 25)}
+        rows = {h: [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z] for h in HOURS}
     else:
         shape_by_hour, weights = shape(curves, p1)
         beta, mean_x, max_x = size_tilt(curves, weights, shape_by_hour)
         log_p1 = math.log10(p1)
-        correction = 0.0
-        extra = 0.0
-        if beta and mean_x is not None:
-            correction = beta * (min(log_p1, max_x) - mean_x)
-        if max_x is not None and log_p1 > max_x:
-            # Bigger than every comparable: nothing here has seen this regime.
-            extra = EXTRAPOLATION_SPREAD * (log_p1 - max_x)
+        correction = beta * (min(log_p1, max_x) - mean_x) if beta and mean_x is not None else 0.0
+        extra = EXTRAPOLATION_SPREAD * (log_p1 - max_x) if max_x is not None and log_p1 > max_x else 0.0
         rows = {}
-        for h in range(2, 25):
+        for h in HOURS:
             mu = shape_by_hour[h] + correction
             sigma = (SPREAD_BASE + SPREAD_GROWTH * math.sqrt(h - 1)) * SPREAD_WIDEN + extra
             rows[h] = [p1 * math.exp(mu + z * sigma) for z in Z]
 
-    hours = []
-    for h in range(2, 25):
-        quantiles = [min(MAX_QUANTILE, max(MIN_QUANTILE, q)) for q in rows[h]]
-        quantiles.sort()
-        hours.append({"hour": h, "q": [round(q, 4) for q in quantiles]})
-    return {"hours": hours}
+    out = []
+    for h in HOURS:
+        quantiles = sorted(min(MAX_QUANTILE, max(MIN_QUANTILE, q)) for q in rows[h])
+        out.append({"hour": h, "q": [round(q, 4) for q in quantiles]})
+    return {"hours": out}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        out = forecast_case(case)
-        text = json.dumps(out, separators=(",", ":"), sort_keys=False)
+        text = json.dumps(forecast_case(case), separators=(",", ":"))
         (OUTPUT_DIR / (path.stem + ".out")).write_text(text + "\n", encoding="utf-8")
 
 
